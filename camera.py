@@ -40,6 +40,12 @@ class OrbbecCamera:
         # Depth scale (mm -> m conversion factor)
         self.depth_scale: float = 1.0
 
+        # Camera intrinsics & extrinsics (populated after pipeline start)
+        self.depth_intrinsic: Optional[tuple] = None  # (fx, fy, cx, cy, w, h)
+        self.color_intrinsic: Optional[tuple] = None  # (fx, fy, cx, cy, w, h)
+        self.extrinsic_rot: Optional[np.ndarray] = None  # 3x3 rotation depth->color
+        self.extrinsic_trans: Optional[np.ndarray] = None  # 3x1 translation (mm)
+
         # Recording state
         self.recording = False
         self.color_writer: Optional[cv2.VideoWriter] = None
@@ -55,7 +61,7 @@ class OrbbecCamera:
         self.pipeline = Pipeline()
         self.config = Config()
 
-        # Enable depth stream (default: 848x480 Y16 @ 30fps)
+        # Enable depth stream
         try:
             depth_profiles = self.pipeline.get_stream_profile_list(
                 OBSensorType.DEPTH_SENSOR
@@ -65,7 +71,7 @@ class OrbbecCamera:
         except Exception:
             pass
 
-        # Enable color stream (default: 1280x720 MJPG @ 30fps)
+        # Enable color stream
         try:
             color_profiles = self.pipeline.get_stream_profile_list(
                 OBSensorType.COLOR_SENSOR
@@ -73,10 +79,54 @@ class OrbbecCamera:
             color_profile = color_profiles.get_default_video_stream_profile()
             self.config.enable_stream(color_profile)
         except Exception:
-            pass  # Some devices may not have color sensor
+            pass
 
         self.pipeline.start(self.config)
         self.running = True
+        self._read_calibration()
+
+    def _read_calibration(self) -> None:
+        """Read intrinsics and extrinsics from the running pipeline."""
+        # Depth intrinsics from stream profile
+        try:
+            profiles = self.pipeline.get_stream_profile_list(
+                OBSensorType.DEPTH_SENSOR
+            )
+            prof = profiles.get_default_video_stream_profile()
+            intr = prof.get_intrinsic()
+            if intr.fx > 0:
+                self.depth_intrinsic = (
+                    intr.fx, intr.fy, intr.cx, intr.cy, intr.width, intr.height
+                )
+        except Exception:
+            pass
+
+        # Color intrinsics from stream profile
+        try:
+            profiles = self.pipeline.get_stream_profile_list(
+                OBSensorType.COLOR_SENSOR
+            )
+            prof = profiles.get_default_video_stream_profile()
+            intr = prof.get_intrinsic()
+            if intr.fx > 0:
+                self.color_intrinsic = (
+                    intr.fx, intr.fy, intr.cx, intr.cy, intr.width, intr.height
+                )
+        except Exception:
+            pass
+
+        # Extrinsics (depth -> color transform)
+        try:
+            params = self.pipeline.get_camera_param()
+            ext = params.transform
+            rot = np.array(ext.rot).reshape(3, 3)
+            trans = np.array(ext.transform).reshape(3)
+            # Only use if non-zero
+            if np.any(rot != 0):
+                self.extrinsic_rot = rot
+                self.extrinsic_trans = trans
+        except Exception:
+            pass
 
     def stop(self) -> None:
         """Stop the camera pipeline and release resources."""
@@ -124,7 +174,6 @@ class OrbbecCamera:
                     data.reshape((h, w, 2)), cv2.COLOR_YUV2BGR_YUYV
                 )
             else:
-                # Assume BGR
                 try:
                     self.color_image = data.reshape((h, w, 3)).copy()
                 except ValueError:
@@ -138,7 +187,6 @@ class OrbbecCamera:
             h = depth_frame.get_height()
             self.depth_scale = depth_frame.get_depth_scale()
             data = np.asarray(depth_frame.get_data())
-            # Y16 format: raw bytes need to be viewed as uint16 first
             if data.dtype == np.uint8:
                 data = data.view(np.uint16)
             self.depth_raw = data.reshape((h, w)).astype(np.uint16).copy()
@@ -150,7 +198,6 @@ class OrbbecCamera:
             self.depth_image = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
             got_frame = True
 
-        # Write to video if recording
         if self.recording:
             self._write_recording_frame()
 
@@ -219,7 +266,11 @@ class OrbbecCamera:
     # ---- Point Cloud ----
 
     def save_ply(self) -> str:
-        """Generate and save a PLY point cloud from current depth (+ color).
+        """Generate and save a colored PLY point cloud.
+
+        Uses the raw (unaligned) depth with the depth camera's own intrinsics,
+        then projects each 3D point into the color camera via extrinsics to
+        obtain per-point color.
 
         Returns the saved file path, or empty string on failure.
         """
@@ -231,41 +282,59 @@ class OrbbecCamera:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self.output_dir, f"pointcloud_{ts}.ply")
 
-        h, w = self.depth_raw.shape
+        depth = self.depth_raw.astype(np.float64)
+        dh, dw = depth.shape
 
-        # Try to read intrinsics from the pipeline; fall back to approximate values
-        try:
-            params = self.pipeline.get_camera_param()
-            dp = params.depth_intrinsic
-            fx, fy, cx, cy = dp.fx, dp.fy, dp.cx, dp.cy
-        except Exception:
-            fx = fy = 0.6 * w  # rough estimate
-            cx, cy = w / 2.0, h / 2.0
-
-        intrinsic = o3d.camera.PinholeCameraIntrinsic(w, h, fx, fy, cx, cy)
-
-        # depth_scale: raw depth values are in mm, Open3D needs the divisor to get meters
-        depth_o3d = o3d.geometry.Image(self.depth_raw.astype(np.uint16))
-
-        if self.color_image is not None:
-            color_resized = cv2.resize(self.color_image, (w, h))
-            color_rgb = cv2.cvtColor(color_resized, cv2.COLOR_BGR2RGB)
-            color_o3d = o3d.geometry.Image(color_rgb.astype(np.uint8))
-            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                color_o3d,
-                depth_o3d,
-                depth_scale=1000.0,
-                depth_trunc=5.0,
-                convert_rgb_to_intensity=False,
-            )
-            pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic)
+        # Depth intrinsics
+        if self.depth_intrinsic and self.depth_intrinsic[0] > 0:
+            fx_d, fy_d, cx_d, cy_d = self.depth_intrinsic[:4]
         else:
-            pcd = o3d.geometry.PointCloud.create_from_depth_image(
-                depth_o3d,
-                intrinsic,
-                depth_scale=1000.0,
-                depth_trunc=5.0,
+            fx_d = fy_d = 0.6 * dw
+            cx_d, cy_d = dw / 2.0, dh / 2.0
+
+        # Valid mask: non-zero depth, within reasonable range
+        valid = (depth > 0) & (depth < 10000)
+        vs, us = np.where(valid)
+        zs = depth[valid]  # mm
+
+        # Back-project to 3D in depth camera frame (meters)
+        xs = (us - cx_d) * zs / fx_d
+        ys = (vs - cy_d) * zs / fy_d
+        points_d = np.stack([xs, ys, zs], axis=-1)  # (N, 3) in mm
+
+        # Convert to meters
+        points_m = points_d / 1000.0
+
+        # Build point cloud
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points_m)
+
+        # Project to color for per-point coloring
+        if (
+            self.color_image is not None
+            and self.color_intrinsic is not None
+            and self.extrinsic_rot is not None
+        ):
+            fx_c, fy_c, cx_c, cy_c = self.color_intrinsic[:4]
+            ch, cw = self.color_image.shape[:2]
+
+            # Transform depth -> color camera frame (in mm)
+            points_c = (self.extrinsic_rot @ points_d.T).T + self.extrinsic_trans
+            # Project to color image plane
+            u_c = (points_c[:, 0] * fx_c / points_c[:, 2] + cx_c).astype(np.int32)
+            v_c = (points_c[:, 1] * fy_c / points_c[:, 2] + cy_c).astype(np.int32)
+            # Mask for valid projections
+            color_valid = (u_c >= 0) & (u_c < cw) & (v_c >= 0) & (v_c < ch)
+
+            color_rgb = cv2.cvtColor(self.color_image, cv2.COLOR_BGR2RGB)
+            colors = np.ones((len(points_m), 3), dtype=np.float64) * 0.5
+            colors[color_valid] = (
+                color_rgb[v_c[color_valid], u_c[color_valid]].astype(np.float64) / 255.0
             )
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        # Remove statistical outliers
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
 
         o3d.io.write_point_cloud(path, pcd)
         return path
