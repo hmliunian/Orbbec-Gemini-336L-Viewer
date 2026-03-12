@@ -12,10 +12,11 @@ _GRASPGEN_ROOT = Path(__file__).resolve().parent / "third_party" / "GraspGen"
 if str(_GRASPGEN_ROOT) not in sys.path:
     sys.path.insert(0, str(_GRASPGEN_ROOT))
 
-# Default config path (franka panda)
-_DEFAULT_CONFIG = _GRASPGEN_ROOT / "GraspGenModels" / "checkpoints" / "graspgen_franka_panda.yml"
+# Default config path
+_DEFAULT_CONFIG = _GRASPGEN_ROOT / "GraspGenModels" / "checkpoints" / "graspgen_g2.yml"
 
 AVAILABLE_GRIPPERS = {
+    "g2": "graspgen_g2.yml",
     "franka_panda": "graspgen_franka_panda.yml",
     "robotiq_2f_140": "graspgen_robotiq_2f_140.yml",
     "single_suction_cup_30mm": "graspgen_single_suction_cup_30mm.yml",
@@ -25,10 +26,11 @@ AVAILABLE_GRIPPERS = {
 class GraspModel:
     """Wraps GraspGenSampler for grasp pose generation."""
 
-    def __init__(self, gripper_name: str = "franka_panda"):
+    def __init__(self, gripper_name: str = "g2"):
         self.gripper_name = gripper_name
         self.sampler = None
         self._cfg = None
+        self._collision_mesh = None
 
     @property
     def loaded(self) -> bool:
@@ -46,9 +48,14 @@ class GraspModel:
             raise FileNotFoundError(f"Config not found: {config_path}")
 
         from grasp_gen.grasp_server import GraspGenSampler, load_grasp_cfg
+        from grasp_gen.robot import get_gripper_info
 
         self._cfg = load_grasp_cfg(str(config_path))
         self.sampler = GraspGenSampler(self._cfg)
+
+        # Load gripper collision mesh for scene collision filtering
+        gripper_info = get_gripper_info(self.gripper_name)
+        self._collision_mesh = gripper_info.collision_mesh
 
     def generate(
         self,
@@ -84,6 +91,77 @@ class GraspModel:
             "poses": grasps.cpu().numpy(),
             "scores": confs.cpu().numpy(),
         }
+
+    def filter_collisions(
+        self,
+        poses: np.ndarray,
+        scores: np.ndarray,
+        scene_pc: np.ndarray,
+        obj_mask: np.ndarray,
+        collision_threshold: float = 0.01,
+        max_scene_points: int = 8192,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Filter grasps that collide with the scene (excluding the target object).
+
+        Mirrors the logic in demo_scene_pc.py:
+        1. Remove object points from scene point cloud
+        2. Downsample scene for speed
+        3. Call filter_colliding_grasps with gripper collision mesh
+
+        Args:
+            poses: (K, 4, 4) grasp poses
+            scores: (K,) confidence scores
+            scene_pc: (N, 3) full scene point cloud (flat)
+            obj_mask: (N,) bool mask — True for object points
+            collision_threshold: distance threshold in meters
+            max_scene_points: max scene points for collision check
+
+        Returns:
+            filtered_poses: (M, 4, 4) collision-free grasp poses
+            filtered_scores: (M,) corresponding scores
+        """
+        if self._collision_mesh is None:
+            raise RuntimeError("Call load() first")
+        if len(poses) == 0:
+            return poses, scores
+
+        from grasp_gen.utils.point_cloud_utils import filter_colliding_grasps
+
+        # Remove object points — grasps near the object are expected
+        scene_no_obj = scene_pc[~obj_mask]
+
+        # Keep only finite points
+        valid = np.isfinite(scene_no_obj).all(axis=-1) & (scene_no_obj[:, 2] > 0)
+        scene_no_obj = scene_no_obj[valid]
+
+        if len(scene_no_obj) == 0:
+            print("[GraspGen] No scene points left after removing object — skipping collision filter")
+            return poses, scores
+
+        # Downsample for speed
+        if len(scene_no_obj) > max_scene_points:
+            idx = np.random.choice(len(scene_no_obj), max_scene_points, replace=False)
+            scene_ds = scene_no_obj[idx]
+            print(f"[GraspGen] Downsampled scene from {len(scene_no_obj)} to {len(scene_ds)} points")
+        else:
+            scene_ds = scene_no_obj
+            print(f"[GraspGen] Scene has {len(scene_ds)} points (no downsampling needed)")
+
+        # Ensure homogeneous coordinate
+        poses_check = poses.copy()
+        poses_check[:, 3, 3] = 1
+
+        collision_free_mask = filter_colliding_grasps(
+            scene_pc=scene_ds,
+            grasp_poses=poses_check,
+            gripper_collision_mesh=self._collision_mesh,
+            collision_threshold=collision_threshold,
+        )
+
+        n_free = collision_free_mask.sum()
+        print(f"[GraspGen] Collision filter: {n_free}/{len(poses)} grasps are collision-free")
+
+        return poses[collision_free_mask], scores[collision_free_mask]
 
 
 def extract_object_pointcloud(

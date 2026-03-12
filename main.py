@@ -175,10 +175,10 @@ class App(ctk.CTk):
         ctk.CTkLabel(sidebar, text="Gripper", font=ctk.CTkFont(size=11),
                       text_color=C_TEXT_DIM).pack(anchor="w", padx=16, pady=(10, 2))
         self.combo_gripper = ctk.CTkComboBox(
-            sidebar, values=["franka_panda", "robotiq_2f_140", "single_suction_cup_30mm"],
+            sidebar, values=["g2", "franka_panda", "robotiq_2f_140", "single_suction_cup_30mm"],
             height=28, fg_color=C_CARD, border_width=0, dropdown_fg_color=C_CARD,
         )
-        self.combo_gripper.set("franka_panda")
+        self.combo_gripper.set("g2")
         self.combo_gripper.pack(fill="x", padx=16)
 
         # Num grasps
@@ -704,6 +704,27 @@ class App(ctk.CTk):
                 result = self._grasp_model.generate(
                     grasp_pts, num_grasps=num_grasps, topk=num_grasps, threshold=threshold,
                 )
+
+                # Filter grasps that collide with the scene
+                if len(result["poses"]) > 0:
+                    # Build object mask on flattened scene point cloud
+                    h, w = points.shape[:2]
+                    scene_flat = points.reshape(-1, 3)
+                    mask_resized = self._selected_mask
+                    if mask_resized.shape != (h, w):
+                        mask_resized = cv2.resize(
+                            mask_resized.astype(np.uint8), (w, h),
+                            interpolation=cv2.INTER_NEAREST,
+                        ).astype(bool)
+                    obj_mask_flat = mask_resized.reshape(-1)
+
+                    result["poses"], result["scores"] = self._grasp_model.filter_collisions(
+                        poses=result["poses"],
+                        scores=result["scores"],
+                        scene_pc=scene_flat,
+                        obj_mask=obj_mask_flat,
+                    )
+
                 result["obj_points"] = obj_pts
                 result["obj_colors"] = obj_colors
                 result["scene_points"] = points.reshape(-1, 3)
