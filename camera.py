@@ -51,6 +51,10 @@ class OrbbecCamera:
         self.color_writer: Optional[cv2.VideoWriter] = None
         self.depth_writer: Optional[cv2.VideoWriter] = None
 
+        # Depth refinement model (lazy-loaded)
+        self._refine_model = None
+        self._refine_device = None
+
     def start(self) -> None:
         """Initialize and start the camera pipeline."""
         if not HAS_SDK:
@@ -265,76 +269,83 @@ class OrbbecCamera:
 
     # ---- Point Cloud ----
 
-    def save_ply(self) -> str:
-        """Generate and save a colored PLY point cloud.
+    def _get_refine_model(self):
+        """Lazy-load the lingbot-depth model on first use."""
+        if self._refine_model is None:
+            import torch
+            from mdm.model.v2 import MDMModel
 
-        Uses the raw (unaligned) depth with the depth camera's own intrinsics,
-        then projects each 3D point into the color camera via extrinsics to
-        obtain per-point color.
+            self._refine_device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+            self._refine_model = MDMModel.from_pretrained(
+                "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
+            ).to(self._refine_device)
+        return self._refine_model, self._refine_device
+
+    def save_ply(self) -> str:
+        """Generate and save a colored PLY point cloud using lingbot-depth.
+
+        Feeds RGB + raw depth + intrinsics to lingbot-depth, then saves
+        the model's point cloud output directly as PLY.
 
         Returns the saved file path, or empty string on failure.
         """
-        if self.depth_raw is None:
+        if self.depth_raw is None or self.color_image is None:
             return ""
 
-        import open3d as o3d
+        import torch
+        import trimesh
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self.output_dir, f"pointcloud_{ts}.ply")
 
-        depth = self.depth_raw.astype(np.float64)
-        dh, dw = depth.shape
+        model, device = self._get_refine_model()
 
-        # Depth intrinsics
+        # Prepare RGB: BGR -> RGB, normalize to [0,1], shape [1,3,H,W]
+        image_rgb = cv2.cvtColor(self.color_image, cv2.COLOR_BGR2RGB)
+        h, w = image_rgb.shape[:2]
+        image_tensor = torch.tensor(
+            image_rgb / 255.0, dtype=torch.float32, device=device
+        ).permute(2, 0, 1).unsqueeze(0)
+
+        # Prepare depth: uint16 mm -> float32 meters, resize to match RGB
+        depth_m = self.depth_raw.astype(np.float32) / 1000.0
+        dh, dw = depth_m.shape
+        if (dh, dw) != (h, w):
+            depth_m = cv2.resize(depth_m, (w, h), interpolation=cv2.INTER_NEAREST)
+        depth_m = np.nan_to_num(depth_m, nan=0.0, posinf=0.0, neginf=0.0)
+        depth_tensor = torch.tensor(depth_m, dtype=torch.float32, device=device)
+
+        # Prepare normalized intrinsics
         if self.depth_intrinsic and self.depth_intrinsic[0] > 0:
-            fx_d, fy_d, cx_d, cy_d = self.depth_intrinsic[:4]
+            fx, fy, cx, cy = self.depth_intrinsic[:4]
         else:
-            fx_d = fy_d = 0.6 * dw
-            cx_d, cy_d = dw / 2.0, dh / 2.0
+            fx = fy = 0.6 * w
+            cx, cy = w / 2.0, h / 2.0
 
-        # Valid mask: non-zero depth, within reasonable range
-        valid = (depth > 0) & (depth < 10000)
-        vs, us = np.where(valid)
-        zs = depth[valid]  # mm
+        intrinsics = np.array([
+            [fx / w, 0.0,    cx / w],
+            [0.0,    fy / h, cy / h],
+            [0.0,    0.0,    1.0],
+        ], dtype=np.float32)
+        intrinsics_tensor = torch.tensor(
+            intrinsics, dtype=torch.float32, device=device
+        ).unsqueeze(0)
 
-        # Back-project to 3D in depth camera frame (meters)
-        xs = (us - cx_d) * zs / fx_d
-        ys = (vs - cy_d) * zs / fy_d
-        points_d = np.stack([xs, ys, zs], axis=-1)  # (N, 3) in mm
-
-        # Convert to meters
-        points_m = points_d / 1000.0
-
-        # Build point cloud
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points_m)
-
-        # Project to color for per-point coloring
-        if (
-            self.color_image is not None
-            and self.color_intrinsic is not None
-            and self.extrinsic_rot is not None
-        ):
-            fx_c, fy_c, cx_c, cy_c = self.color_intrinsic[:4]
-            ch, cw = self.color_image.shape[:2]
-
-            # Transform depth -> color camera frame (in mm)
-            points_c = (self.extrinsic_rot @ points_d.T).T + self.extrinsic_trans
-            # Project to color image plane
-            u_c = (points_c[:, 0] * fx_c / points_c[:, 2] + cx_c).astype(np.int32)
-            v_c = (points_c[:, 1] * fy_c / points_c[:, 2] + cy_c).astype(np.int32)
-            # Mask for valid projections
-            color_valid = (u_c >= 0) & (u_c < cw) & (v_c >= 0) & (v_c < ch)
-
-            color_rgb = cv2.cvtColor(self.color_image, cv2.COLOR_BGR2RGB)
-            colors = np.ones((len(points_m), 3), dtype=np.float64) * 0.5
-            colors[color_valid] = (
-                color_rgb[v_c[color_valid], u_c[color_valid]].astype(np.float64) / 255.0
+        # Run inference
+        with torch.no_grad():
+            output = model.infer(
+                image_tensor, depth_in=depth_tensor, intrinsics=intrinsics_tensor
             )
-            pcd.colors = o3d.utility.Vector3dVector(colors)
 
-        # Remove statistical outliers
-        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        points_pred = output['points'].squeeze().cpu().numpy()  # [H, W, 3]
 
-        o3d.io.write_point_cloud(path, pcd)
+        # Save PLY directly from model output
+        valid = np.isfinite(points_pred).all(axis=-1) & (points_pred[..., 2] > 0)
+        verts = points_pred[valid]
+        colors = image_rgb[valid]
+
+        pc = trimesh.PointCloud(verts, colors)
+        pc.export(path)
         return path

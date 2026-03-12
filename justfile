@@ -4,10 +4,14 @@ export LD_LIBRARY_PATH := ".venv/lib/python3.11/site-packages:" + env("LD_LIBRAR
 run:
     uv run python main.py
 
-# 安装依赖
+# 安装依赖 (一键完成)
 setup:
     uv sync
     uv pip install pybind11
+    # torch-geometric 全家桶需要源码编译，不能走 uv sync
+    uv pip install torch-scatter torch-cluster --no-build-isolation
+    # GraspGen pointnet2_ops CUDA extension
+    cd third_party/GraspGen/pointnet2_ops && uv pip install --no-build-isolation .
 
 # 从源码编译安装 pyorbbecsdk (Linux)
 build-sdk:

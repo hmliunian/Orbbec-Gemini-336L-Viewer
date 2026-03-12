@@ -1,14 +1,72 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main", "camera", "segmentation", "grasp", "refine_ply"]
+
 [project]
 name = "orbbec-gui"
 version = "0.1.0"
-description = "Add your description here"
+description = "Orbbec RGB-D camera GUI with SAM3 segmentation and GraspGen grasp generation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    # --- GUI & camera ---
     "customtkinter>=5.2.2",
-    "numpy>=2.2.6",
-    "open3d>=0.19.0",
     "opencv-python>=4.13.0.92",
     "pillow>=12.1.1",
     "pyorbbecsdk>=1.3.2",
+    "open3d>=0.19.0",
+    # --- core ---
+    "torch>=2.7.0",
+    "torchvision",
+    "numpy>=2.2.6",
+    "trimesh",
+    # --- lingbot-depth ---
+    "mdm @ git+https://github.com/Robbyant/lingbot-depth.git",
+    # --- SAM3 deps (from sam3/pyproject.toml + notebooks optional) ---
+    "timm>=1.0.17",
+    "tqdm",
+    "ftfy==6.1.1",
+    "regex",
+    "iopath>=0.1.10",
+    "typing_extensions",
+    "huggingface_hub==0.25.2",
+    "einops",
+    "decord",
+    "pycocotools",
+    "psutil",
+    # --- GraspGen deps (from requirements.txt) ---
+    "h5py",
+    "hydra-core",
+    "omegaconf",
+    "meshcat",
+    "scikit-learn",
+    "scipy",
+    "tensorboard",
+    "tensordict",
+    "diffusers==0.11.1",
+    "transformers",
+    "spconv-cu124",
+    "yourdfpy==0.0.56",
+    "addict",
+    # --- GraspGen runtime (need --no-build-isolation) ---
+    "imageio",
+    "webdataset",
 ]
+
+[tool.uv]
+override-dependencies = [
+    "torch>=2.7.0",
+    "xformers>=0.0.35",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }

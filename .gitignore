@@ -11,3 +11,8 @@ wheels/
 
 # Output files
 output/
+log/
+Log/
+
+# Third-party symlinks
+third_party/
