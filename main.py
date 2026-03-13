@@ -1,5 +1,6 @@
 """Orbbec RGB-D Pipeline — Camera → Segment → Grasp Generation GUI."""
 
+import os
 import threading
 import time
 from enum import IntEnum
@@ -178,19 +179,19 @@ class App(ctk.CTk):
             sidebar, values=["g2", "franka_panda", "robotiq_2f_140", "single_suction_cup_30mm"],
             height=28, fg_color=C_CARD, border_width=0, dropdown_fg_color=C_CARD,
         )
-        self.combo_gripper.set("g2")
+        self.combo_gripper.set("robotiq_2f_140")
         self.combo_gripper.pack(fill="x", padx=16)
 
         # Num grasps
         ctk.CTkLabel(sidebar, text="Num grasps", font=ctk.CTkFont(size=11),
                       text_color=C_TEXT_DIM).pack(anchor="w", padx=16, pady=(10, 2))
         self.slider_grasps = ctk.CTkSlider(
-            sidebar, from_=5, to=100, number_of_steps=19,
+            sidebar, from_=50, to=500, number_of_steps=9,
             fg_color=C_CARD, progress_color=C_ACCENT, button_color=C_ACCENT,
         )
-        self.slider_grasps.set(20)
+        self.slider_grasps.set(200)
         self.slider_grasps.pack(fill="x", padx=16)
-        self.lbl_grasps_val = ctk.CTkLabel(sidebar, text="20", font=ctk.CTkFont(size=11),
+        self.lbl_grasps_val = ctk.CTkLabel(sidebar, text="200", font=ctk.CTkFont(size=11),
                                             text_color=C_TEXT_DIM)
         self.lbl_grasps_val.pack(anchor="w", padx=16)
         self.slider_grasps.configure(command=lambda v: self.lbl_grasps_val.configure(text=str(int(v))))
@@ -701,29 +702,90 @@ class App(ctk.CTk):
                     grasp_pts = obj_pts[idx]
                 print(f"[GraspGen] Object points: {len(obj_pts)}, grasp input: {len(grasp_pts)}")
 
-                result = self._grasp_model.generate(
-                    grasp_pts, num_grasps=num_grasps, topk=num_grasps, threshold=threshold,
-                )
+                # Build scene collision data once
+                h, w = points.shape[:2]
+                scene_flat = points.reshape(-1, 3)
+                mask_resized = self._selected_mask
+                if mask_resized.shape != (h, w):
+                    mask_resized = cv2.resize(
+                        mask_resized.astype(np.uint8), (w, h),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+                obj_mask_flat = mask_resized.reshape(-1)
 
-                # Filter grasps that collide with the scene
-                if len(result["poses"]) > 0:
-                    # Build object mask on flattened scene point cloud
-                    h, w = points.shape[:2]
-                    scene_flat = points.reshape(-1, 3)
-                    mask_resized = self._selected_mask
-                    if mask_resized.shape != (h, w):
-                        mask_resized = cv2.resize(
-                            mask_resized.astype(np.uint8), (w, h),
-                            interpolation=cv2.INTER_NEAREST,
-                        ).astype(bool)
-                    obj_mask_flat = mask_resized.reshape(-1)
+                # Loop generate + filter until we have 50 collision-free grasps
+                TARGET_GRASPS = 50
+                MAX_ROUNDS = 15
+                all_poses = []
+                all_scores = []
 
-                    result["poses"], result["scores"] = self._grasp_model.filter_collisions(
-                        poses=result["poses"],
-                        scores=result["scores"],
-                        scene_pc=scene_flat,
-                        obj_mask=obj_mask_flat,
+                for round_i in range(MAX_ROUNDS):
+                    result = self._grasp_model.generate(
+                        grasp_pts, num_grasps=num_grasps, topk=num_grasps, threshold=threshold,
                     )
+                    if len(result["poses"]) > 0:
+                        filtered_poses, filtered_scores = self._grasp_model.filter_collisions(
+                            poses=result["poses"],
+                            scores=result["scores"],
+                            scene_pc=scene_flat,
+                            obj_mask=obj_mask_flat,
+                        )
+                        if len(filtered_poses) > 0:
+                            all_poses.append(filtered_poses)
+                            all_scores.append(filtered_scores)
+
+                    collected = sum(len(p) for p in all_poses)
+                    print(f"[GraspGen] Round {round_i+1}: collected {collected}/{TARGET_GRASPS} collision-free grasps")
+                    if collected >= TARGET_GRASPS:
+                        break
+
+                if len(all_poses) > 0:
+                    all_poses = np.concatenate(all_poses, axis=0)[:TARGET_GRASPS]
+                    all_scores = np.concatenate(all_scores, axis=0)[:TARGET_GRASPS]
+                else:
+                    all_poses = np.empty((0, 4, 4))
+                    all_scores = np.empty(0)
+
+                # Put back into result for downstream visualization
+                result["poses"] = all_poses
+                result["scores"] = all_scores
+
+                # --- Save point clouds for each collision-free grasp ---
+                import trimesh
+
+                gripper_open_mesh = trimesh.load("/home/xuran-yao/Desktop/g2_gripper/gripper_down.obj")
+                gripper_close_mesh = trimesh.load("/home/xuran-yao/Desktop/g2_gripper/g2_close.obj")
+
+                gripper_open_pts = gripper_open_mesh.sample(1024)
+                gripper_close_pts = gripper_close_mesh.sample(1024)
+                tip_offset_local = np.array([0.0, 0.0, 0.019])
+
+                if len(obj_pts) > 4096:
+                    save_idx = np.random.choice(len(obj_pts), 4096, replace=False)
+                    obj_pts_save = obj_pts[save_idx]
+                else:
+                    obj_pts_save = obj_pts
+
+                save_dir = os.path.join(self.camera.output_dir, "grasp_pcds")
+                os.makedirs(save_dir, exist_ok=True)
+
+                # Save one object point cloud + 50 gripper open/close
+                np.save(os.path.join(save_dir, "object.npy"), obj_pts_save)
+
+                poses_save = all_poses.copy()
+                if len(poses_save) > 0:
+                    poses_save[:, 3, 3] = 1
+                for i, (pose, score) in enumerate(zip(poses_save, all_scores)):
+                    R = pose[:3, :3]
+                    t = pose[:3, 3]
+                    tip_world = R @ tip_offset_local
+                    open_world = (R @ gripper_open_pts.T).T + t + tip_world
+                    close_world = (R @ gripper_close_pts.T).T + t + tip_world
+
+                    np.save(os.path.join(save_dir, f"grasp_{i:03d}_gripper_open.npy"), open_world)
+                    np.save(os.path.join(save_dir, f"grasp_{i:03d}_gripper_close.npy"), close_world)
+
+                print(f"[GraspGen] Saved {len(poses_save)} grasps + 1 object to {save_dir}")
 
                 result["obj_points"] = obj_pts
                 result["obj_colors"] = obj_colors
